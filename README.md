@@ -1,8 +1,6 @@
 # Physics-Informed-Machine-Learning-Code
 This repository contains the Masters Thesis Project Code and some additional codes. 
 # Code 1( the thesis code)
-
-
 This framework runs a 30-fold Monte Carlo experiment to benchmark six different machine learning and physics-informed regression models. The objective is to fit qubit energy relaxation decay curves under severe data constraints and reconstruct the hidden two-state switching distribution caused by Two-Level System (TLS) noise.
 
 ## 1. Data Generation Process
@@ -44,11 +42,8 @@ Models are strictly benchmarked across five metrics averaged over all 30 validat
 * **Train / Test MSE:** Mean Squared Error calculated on the training and testing data splits to determine curve-fitting precision.
 * **$R^2$ Score:** Coefficient of determination on the test set to evaluate total variance explained.
 * **Generalization Gap ($\text{Gap}$):** Quantifies over-fitting tendencies using the normalized difference:
-  
   $$\text{Gap} = \frac{|\text{MSE}_{\text{train}} - \text{MSE}_{\text{test}}|}{\text{MSE}_{\text{test}} + 10^{-8}}$$
-
 * **Physics Residual:** Evaluates strict compliance with the underlying physical ordinary differential equation:
-  
   $$\text{Residual} = \frac{1}{N}\sum_{i=1}^N \left( \frac{dy_i}{dt} + \lambda_{\text{ref}} y_i \right)^2$$
 
 ---
@@ -62,3 +57,5 @@ $$\Delta\text{BIC} = \text{BIC}_1 - \text{BIC}_2$$
 ### Interpretation
 * **Positive $\Delta\text{BIC}$:** The model correctly retains the underlying physical traits, confirming that a two-state bimodal switching structure (the hidden $42\,\mu\text{s}$ and $58\,\mu\text{s}$ TLS targets) is preferred.
 * **Negative $\Delta\text{BIC}$:** The model fails to resolve the physical parameters, smoothing the predictions into an incorrect, single-component average curve.
+
+
