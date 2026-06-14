@@ -1,6 +1,8 @@
 # Physics-Informed-Machine-Learning-Code
 This repository contains the Masters Thesis Project Code and some additional codes. 
 # Code 1( the thesis code)
+
+
 This framework runs a 30-fold Monte Carlo experiment to benchmark six different machine learning and physics-informed regression models. The objective is to fit qubit energy relaxation decay curves under severe data constraints and reconstruct the hidden two-state switching distribution caused by Two-Level System (TLS) noise.
 
 ## 1. Data Generation Process
@@ -19,7 +21,7 @@ The synthetic dataset simulates 2,000 experimental cycles of a qubit undergoing 
 The framework compares standard data-driven methods, pure physics-informed neural networks, and hybrid architectures:
 
 * **NN (SirenNet):** A deep neural network utilizing Sinusoidal Representation (SIREN) layers with a frequency scaling parameter ($w_0 = 10.0$) to fit the coordinate-to-value mapping.
-**PINN (Physics-Informed Neural Network):** Parallel SIREN networks that jointly predict the population curve $y(t)$ and the continuous decay rate $\lambda(t)$. It optimizes a combined loss function:
+* **PINN (Physics-Informed Neural Network):** Parallel SIREN networks that jointly predict the population curve $y(t)$ and the continuous decay rate $\lambda(t)$. It optimizes a combined loss function:
   $$\mathcal{L} = e^{-s_d} \mathcal{L}_{\text{data}} + s_d + e^{-s_p} \mathcal{L}_{\text{physics}} + s_p$$
   where $s_d$ and $s_p$ are learned adaptive log-variance parameters used to dynamically balance data fidelity and the physical derivative constraint ($\frac{dy}{dt} + \lambda y = 0$).
 * **HYB (Hybrid PINN + Neural Residual):** Features a frozen, pre-trained PINN architecture supplemented by an independent SIREN residual network tasked with fitting the remaining unmodeled data variance.
@@ -42,8 +44,11 @@ Models are strictly benchmarked across five metrics averaged over all 30 validat
 * **Train / Test MSE:** Mean Squared Error calculated on the training and testing data splits to determine curve-fitting precision.
 * **$R^2$ Score:** Coefficient of determination on the test set to evaluate total variance explained.
 * **Generalization Gap ($\text{Gap}$):** Quantifies over-fitting tendencies using the normalized difference:
+  
   $$\text{Gap} = \frac{|\text{MSE}_{\text{train}} - \text{MSE}_{\text{test}}|}{\text{MSE}_{\text{test}} + 10^{-8}}$$
+
 * **Physics Residual:** Evaluates strict compliance with the underlying physical ordinary differential equation:
+  
   $$\text{Residual} = \frac{1}{N}\sum_{i=1}^N \left( \frac{dy_i}{dt} + \lambda_{\text{ref}} y_i \right)^2$$
 
 ---
