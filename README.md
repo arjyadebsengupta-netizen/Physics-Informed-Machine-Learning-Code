@@ -11,7 +11,8 @@ The synthetic dataset simulates 2,000 experimental cycles of a qubit undergoing 
   * State 1: $T_1 = 42.0\,\mu\text{s}$
 * **Fluctuations:** Gaussian noise ($\sigma = 2.0$) is added directly to the $T_1$ values, and independent readout noise ($\sigma = 0.015$) is added to the population probability ($P_e$).
 * **Governing Equation:** The underlying physical profile follows single-exponential decay:
-  $$\frac{dP_e}{dt} = -\lambda P_e \implies P_e(t) = \exp\left(-\frac{t}{T_1}\right)$$
+
+$$\frac{dP_e}{dt} = -\lambda P_e \implies P_e(t) = \exp\left(-\frac{t}{T_1}\right)$$
 
 ---
 
@@ -19,9 +20,12 @@ The synthetic dataset simulates 2,000 experimental cycles of a qubit undergoing 
 The framework compares standard data-driven methods, pure physics-informed neural networks, and hybrid architectures:
 
 * **NN (SirenNet):** A deep neural network utilizing Sinusoidal Representation (SIREN) layers with a frequency scaling parameter ($w_0 = 10.0$) to fit the coordinate-to-value mapping.
-* **PINN (Physics-Informed Neural Network):** Parallel SIREN networks that jointly predict the population curve $y(t)$ and the continuous decay rate $\lambda(t)$. It optimizes a combined loss function:
-  $$\mathcal{L} = e^{-s_d} \mathcal{L}_{\text{data}} + s_d + e^{-s_p} \mathcal{L}_{\text{physics}} + s_p$$
-  where $s_d$ and $s_p$ are learned adaptive log-variance parameters used to dynamically balance data fidelity and the physical derivative constraint ($\frac{dy}{dt} + \lambda y = 0$).
+* **PINN (Physics-Informed Neural Network):** Parallel SIREN networks that jointly predict the population curve $y(t)$ and the continuous decay rate $\lambda(t)$.
+
+The PINN optimizes a combined loss function where $s_d$ and $s_p$ are learned adaptive log-variance parameters used to dynamically balance data fidelity and the physical derivative constraint ($\frac{dy}{dt} + \lambda y = 0$):
+
+$$\mathcal{L} = e^{-s_d} \mathcal{L}_{\text{data}} + s_d + e^{-s_p} \mathcal{L}_{\text{physics}} + s_p$$
+
 * **HYB (Hybrid PINN + Neural Residual):** Features a frozen, pre-trained PINN architecture supplemented by an independent SIREN residual network tasked with fitting the remaining unmodeled data variance.
 * **GB (Gradient Boosting):** A standard non-parametric tree ensemble (300 estimators) trained purely on the empirical coordinate data points.
 * **PILR (Physics-Informed Linear Regression):** A linear framework that projects inputs onto a combined baseline matrix composed of a constant offset and an exact physical exponential decay basis ($\exp(-t \cdot \lambda_{\text{ref}})$).
@@ -39,12 +43,16 @@ For each of the 30 Monte Carlo iterations, the framework executes the following 
 
 ## 4. Evaluation Metrics
 Models are strictly benchmarked across five metrics averaged over all 30 validation runs:
+
 * **Train / Test MSE:** Mean Squared Error calculated on the training and testing data splits to determine curve-fitting precision.
 * **$R^2$ Score:** Coefficient of determination on the test set to evaluate total variance explained.
 * **Generalization Gap ($\text{Gap}$):** Quantifies over-fitting tendencies using the normalized difference:
-  $$\text{Gap} = \frac{|\text{MSE}_{\text{train}} - \text{MSE}_{\text{test}}|}{\text{MSE}_{\text{test}} + 10^{-8}}$$
+
+$$\text{Gap} = \frac{|\text{MSE}_{\text{train}} - \text{MSE}_{\text{test}}|}{\text{MSE}_{\text{test}} + 10^{-8}}$$
+
 * **Physics Residual:** Evaluates strict compliance with the underlying physical ordinary differential equation:
-  $$\text{Residual} = \frac{1}{N}\sum_{i=1}^N \left( \frac{dy_i}{dt} + \lambda_{\text{ref}} y_i \right)^2$$
+
+$$\text{Residual} = \frac{1}{N}\sum_{i=1}^N \left( \frac{dy_i}{dt} + \lambda_{\text{ref}} y_i \right)^2$$
 
 ---
 
@@ -52,6 +60,7 @@ Models are strictly benchmarked across five metrics averaged over all 30 validat
 To test if a model preserves the physical integrity of the true underlying noise distribution, the script takes the predicted decay curves, extracts their numerical gradients, and maps them back into a continuous profile of effective lifetimes ($T_1 = 1/\lambda$). 
 
 A Gaussian Mixture Model (GMM) fits both a 1-component (unimodal) and a 2-component (bimodal) distribution over these extracted lifetimes. The model's performance footprint is evaluated via the Bayesian Information Criterion (BIC) drop:
+
 $$\Delta\text{BIC} = \text{BIC}_1 - \text{BIC}_2$$
 
 ### Interpretation
