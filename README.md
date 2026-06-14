@@ -19,7 +19,7 @@ The synthetic dataset simulates 2,000 experimental cycles of a qubit undergoing 
 The framework compares standard data-driven methods, pure physics-informed neural networks, and hybrid architectures:
 
 * **NN (SirenNet):** A deep neural network utilizing Sinusoidal Representation (SIREN) layers with a frequency scaling parameter ($w_0 = 10.0$) to fit the coordinate-to-value mapping.
-* **PINN (Physics-Informed Neural Network):** Parallel SIREN networks that jointly predict the population curve $y(t)$ and the continuous decay rate $\lambda(t)$. It optimizes a combined loss function:
+**PINN (Physics-Informed Neural Network):** Parallel SIREN networks that jointly predict the population curve $y(t)$ and the continuous decay rate $\lambda(t)$. It optimizes a combined loss function:
   $$\mathcal{L} = e^{-s_d} \mathcal{L}_{\text{data}} + s_d + e^{-s_p} \mathcal{L}_{\text{physics}} + s_p$$
   where $s_d$ and $s_p$ are learned adaptive log-variance parameters used to dynamically balance data fidelity and the physical derivative constraint ($\frac{dy}{dt} + \lambda y = 0$).
 * **HYB (Hybrid PINN + Neural Residual):** Features a frozen, pre-trained PINN architecture supplemented by an independent SIREN residual network tasked with fitting the remaining unmodeled data variance.
