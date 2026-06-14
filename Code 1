@@ -1,0 +1,327 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as torch_nn
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.mixture import GaussianMixture
+from scipy.optimize import curve_fit
+from sklearn.neighbors import KernelDensity
+
+# =========================================================
+# 0. REPRODUCIBILITY / GPU SETUP
+# =========================================================
+SEED = 42
+os.environ["PYTHONHASHSEED"] = str(SEED)
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+def set_all_seeds(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+set_all_seeds(SEED)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# =========================================================
+# 1. DATASET GENERATION (LORENTZIAN / TELEGRAPHIC)
+# =========================================================
+def generate_data(seed=SEED):
+    rng = np.random.RandomState(seed)
+    iterations = 2000
+    t = np.linspace(0, 200, 50).astype(np.float32)
+
+    y_full, l_true, state = [], [], 0
+    for _ in range(iterations):
+        # Telegraphic switching mimics Lorentzian noise from TLS
+        if rng.rand() < 0.04:
+            state = 1 - state
+
+        # Discrete T1 switching (Qubit A experimental statistics)
+        base_t1 = 58.0 if state == 0 else 42.0
+        T1_eff = base_t1 + rng.normal(0, 2.0)
+
+        # Physics: Single-exponential decay Pe(t) = exp(-t/T1)
+        yi = np.exp(-t / T1_eff) + rng.normal(0, 0.015, len(t))
+        y_full.append(yi)
+        l_true.append(1.0 / T1_eff)
+
+    return t.reshape(-1, 1), np.array(y_full), np.array(l_true)
+
+X, y_history, l_history = generate_data(SEED)
+y = y_history[0].reshape(-1, 1) # Target decay curve for training
+
+# =========================================================
+# 2. MODEL DEFINITIONS (SIREN + PINN + HYBRID)
+# =========================================================
+class SirenLayer(torch_nn.Module):
+    def __init__(self, in_f, out_f, w0=10.0, is_first=False):
+        super().__init__()
+        self.in_f, self.w0, self.is_first = in_f, w0, is_first
+        self.linear = torch_nn.Linear(in_f, out_f)
+        self.init_weights()
+    def init_weights(self):
+        with torch.no_grad():
+            bound = 1.0 / self.in_f if self.is_first else np.sqrt(6.0 / self.in_f) / self.w0
+            self.linear.weight.uniform_(-bound, bound)
+            self.linear.bias.zero_()
+    def forward(self, x):
+        return torch.sin(self.w0 * self.linear(x))
+
+class SirenNet(torch_nn.Module):
+    def __init__(self, in_dim=1, hidden_dim=64, depth=2, out_dim=1, w0=10.0):
+        super().__init__()
+        layers = [SirenLayer(in_dim, hidden_dim, w0=w0, is_first=True)]
+        for _ in range(depth - 1):
+            layers.append(SirenLayer(hidden_dim, hidden_dim, w0=w0, is_first=False))
+        self.net = torch_nn.Sequential(*layers)
+        self.final = torch_nn.Linear(hidden_dim, out_dim)
+        with torch.no_grad():
+            bound = np.sqrt(6.0 / hidden_dim) / w0
+            self.final.weight.uniform_(-bound, bound)
+            self.final.bias.zero_()
+    def forward(self, x):
+        return self.final(self.net(x))
+
+class PINN(torch_nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.y_net, self.lam_net = SirenNet(), SirenNet()
+    def forward(self, x):
+        return self.y_net(x), torch.abs(self.lam_net(x))
+
+class Residual(torch_nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = SirenNet()
+    def forward(self, x):
+        return self.net(x)
+
+class Hybrid(torch_nn.Module):
+    def __init__(self, pinn, res):
+        super().__init__()
+        self.pinn, self.res = pinn, res
+    def forward(self, x):
+        yp, lam = self.pinn(x)
+        return yp + self.res(x), lam
+
+# =========================================================
+# 3. ADAPTIVE TRAINER (NUMERICAL STABILITY)
+# =========================================================
+def train_adam_lbfgs(model, X_tr, y_tr, is_pinn=False, adam_epochs=400, lbfgs_steps=200):
+    Xt = torch.tensor(X_tr, dtype=torch.float32, device=device)
+    yt = torch.tensor(y_tr, dtype=torch.float32, device=device)
+    log_var_data = torch_nn.Parameter(torch.tensor(0.0, device=device))
+    log_var_phys = torch_nn.Parameter(torch.tensor(0.0, device=device))
+    params = list(model.parameters())
+    if is_pinn:
+        Xt = Xt.clone().detach().requires_grad_(True)
+        params += [log_var_data, log_var_phys]
+
+    opt = torch.optim.Adam(params, lr=1e-3)
+    for _ in range(adam_epochs):
+        opt.zero_grad()
+        if is_pinn:
+            y_p, lam = model(Xt)
+            loss_d = ((y_p - yt)**2).mean()
+            dy = torch.autograd.grad(y_p, Xt, torch.ones_like(y_p), create_graph=True)[0]
+            loss_p = ((dy + lam * y_p)**2).mean()
+            lv_d, lv_p = torch.clamp(log_var_data, -5, 5), torch.clamp(log_var_phys, -5, 5)
+            loss = torch.exp(-lv_d) * loss_d + lv_d + torch.exp(-lv_p) * loss_p + lv_p
+        else:
+            y_p = model(Xt)
+            loss = ((y_p - yt)**2).mean()
+        loss.backward(); opt.step()
+
+    lbfgs = torch.optim.LBFGS(params, max_iter=lbfgs_steps, line_search_fn="strong_wolfe")
+    def closure():
+        lbfgs.zero_grad()
+        if is_pinn:
+            y_p, lam = model(Xt)
+            loss_d, dy = ((y_p - yt)**2).mean(), torch.autograd.grad(y_p, Xt, torch.ones_like(y_p), create_graph=True)[0]
+            loss_p = ((dy + lam * y_p)**2).mean()
+            lv_d, lv_p = torch.clamp(log_var_data, -5, 5), torch.clamp(log_var_phys, -5, 5)
+            loss = torch.exp(-lv_d) * loss_d + lv_d + torch.exp(-lv_p) * loss_p + lv_p
+        else:
+            y_p = model(Xt)
+            loss = ((y_p - yt)**2).mean()
+        loss.backward(); return loss
+    lbfgs.step(closure)
+    return model
+
+# =========================================================
+# 4. BASELINES & METRICS
+# =========================================================
+def pilr_fit(X, y, l_ref):
+    # Basis: [Offset, Exponential Decay]
+    # We use 1.0 to capture the vertical shift and exp(-l*t) for the physics
+    P = np.hstack([np.ones_like(X), np.exp(-X * l_ref)])
+    return np.linalg.pinv(P) @ y
+
+def pilr_pred(w, X, l_ref):
+    P = np.hstack([np.ones_like(X), np.exp(-X * l_ref)])
+    return P @ w
+def effective_lambda(x, y_pred):
+    x, y_pred = x.ravel(), np.clip(np.abs(y_pred.ravel()), 1e-8, None)
+    idx = np.argsort(x)
+    return -np.gradient(np.log(y_pred[idx]), x[idx])
+
+def physics_residual_metric(x, y_p, l_ref):
+    x, y_p, l_ref = x.ravel(), y_p.ravel(), l_ref.ravel()
+    idx = np.argsort(x)
+    return float(np.mean((np.gradient(y_p[idx], x[idx]) + l_ref * y_p[idx])**2))
+
+def metrics(y_tr, y_te, tr_p, te_p):
+    tr_mse, te_mse = mean_squared_error(y_tr, tr_p), mean_squared_error(y_te, te_p)
+    return tr_mse, te_mse, r2_score(y_te, te_p), abs(tr_mse - te_mse)/(te_mse + 1e-8)
+
+def bimodality_bics(data, seed=SEED):
+    arr = np.asarray(data).reshape(-1, 1)
+    g1 = GaussianMixture(n_components=1, random_state=seed).fit(arr)
+    g2 = GaussianMixture(n_components=2, random_state=seed).fit(arr)
+    return g1.bic(arr), g2.bic(arr)
+
+# =========================================================
+# 5. MC=30 EXPERIMENT (80/20 SPLIT)
+# =========================================================
+MC, results, preds = 30, [], {k:[] for k in ["NN","PINN","HYB","GB","PILR","PILR_GB"]}
+model_order = ["NN","PINN","HYB","GB","PILR","PILR_GB"]
+l_ref_val = l_history[0]
+
+for mc in range(MC):
+    s_seed = SEED + mc
+    idx_tr, idx_te = train_test_split(np.arange(len(X)), test_size=0.2, random_state=s_seed)
+    X_tr, X_te, y_tr, y_te = X[idx_tr], X[idx_te], y[idx_tr], y[idx_te]
+
+    set_all_seeds(s_seed); m_nn = train_adam_lbfgs(SirenNet().to(device), X_tr, y_tr)
+    set_all_seeds(s_seed); m_pinn = train_adam_lbfgs(PINN().to(device), X_tr, y_tr, is_pinn=True)
+
+    with torch.no_grad():
+        res_tr = y_tr - m_pinn(torch.tensor(X_tr, device=device))[0].cpu().numpy()
+    set_all_seeds(s_seed); m_hyb_res = train_adam_lbfgs(Residual().to(device), X_tr, res_tr)
+    m_hyb = Hybrid(m_pinn, m_hyb_res)
+
+    # 1. Pure Data Gradient Boosting
+    m_gb = GradientBoostingRegressor(random_state=s_seed, n_estimators=300).fit(X_tr, y_tr.ravel())
+
+    # 2. PILR with Exponential Basis (Requires l_ref_val)
+    p_w = pilr_fit(X_tr, y_tr, l_ref_val)
+
+    # 3. PILR_GB (Residual Boosting on top of Exponential Baseline)
+    m_gb_res = GradientBoostingRegressor(random_state=s_seed).fit(X_tr, (y_tr - pilr_pred(p_w, X_tr, l_ref_val)).ravel())
+
+    Xt_f = torch.tensor(X, device=device)
+    with torch.no_grad():
+        p_nn = m_nn(Xt_f).cpu().numpy(); p_pinn = m_pinn(Xt_f)[0].cpu().numpy(); p_hyb = m_hyb(Xt_f)[0].cpu().numpy()
+
+    p_gb = m_gb.predict(X).reshape(-1,1)
+    p_pilr = pilr_pred(p_w, X, l_ref_val)
+    p_pgb = p_pilr + m_gb_res.predict(X).reshape(-1,1)
+
+    for n, p_curr in zip(model_order, [p_nn, p_pinn, p_hyb, p_gb, p_pilr, p_pgb]):
+        preds[n].append(p_curr.ravel())
+        tm, em, r2, gn = metrics(y_tr, y_te, p_curr[idx_tr], p_curr[idx_te])
+        results.append({"Model":n, "Train_MSE":tm, "Test_MSE":em, "R2":r2, "Gen":gn, "Physics_Residual":physics_residual_metric(X, p_curr, l_ref_val)})
+
+# =========================================================
+# 6. SUMMARY TABLE & GRAPHICS
+# =========================================================
+df = pd.DataFrame(results); summary = df.groupby("Model").agg(["mean", "std"]).reindex(model_order)
+print("\n=== FINAL MC=30 SUMMARY (formatted) ===\n")
+pretty_rows = []
+for m in model_order:
+    r = summary.loc[m]
+    pretty_rows.append({
+        "Model": m,
+        "Train_MSE": f"{r[('Train_MSE', 'mean')]:.6e} ± {r[('Train_MSE', 'std')]:.6e}",
+        "Test_MSE": f"{r[('Test_MSE', 'mean')]:.6e} ± {r[('Test_MSE', 'std')]:.6e}",
+        "R2": f"{r[('R2', 'mean')]:.6f} ± {r[('R2', 'std')]:.6f}",
+        "Gen": f"{r[('Gen', 'mean')]:.6e} ± {r[('Gen', 'std')]:.6e}",
+        "Physics_Residual": f"{r[('Physics_Residual', 'mean')]:.6e} ± {r[('Physics_Residual', 'std')]:.6e}"
+    })
+print(pd.DataFrame(pretty_rows).to_string(index=False))
+
+# Plot 1: Mean Predictions Overlay
+plt.figure(figsize=(11, 5))
+plt.scatter(X, y, color='black', s=15, alpha=0.6, label="Actual Data")
+for n in model_order:
+    plt.plot(X, np.mean(preds[n], axis=0), label=f"Model: {n}", linewidth=2)
+plt.title("Model Prediction Comparison: Energy Relaxation Decay Curve")
+plt.xlabel(r"Readout Delay ($\mu s$)")
+plt.ylabel(r"Population ($P_e$)")
+plt.legend(); plt.grid(alpha=0.3); plt.show()
+
+# Plot 2: 2x3 ENSEMBLE TLS IDENTIFIABILITY GRID
+fig, axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True)
+axes = axes.flatten()
+t1_true_dist = 1.0 / l_history
+x_grid = np.linspace(30, 75, 1000).reshape(-1, 1)
+
+for i, n in enumerate(model_order):
+    axes[i].hist(t1_true_dist, bins=40, density=True, color='gray', alpha=0.3, label=r"Actual $T_1$")
+
+    # Extraction Test: Recovering the distribution across 2000 iterations
+    m_p = np.mean(preds[n], axis=0)
+    l_vals = effective_lambda(X, m_p)
+    t1_ext = 1.0 / np.clip(l_vals, 1e-8, None)
+
+    # Kernel Density estimation for the model's performance footprint
+    kde = KernelDensity(bandwidth=1.2).fit(t1_ext.reshape(-1, 1))
+    axes[i].plot(x_grid, np.exp(kde.score_samples(x_grid)), color='red', linewidth=2, label=f"{n} KDE")
+    axes[i].set_title(f"TLS Identifiability: {n}")
+    axes[i].set_xlabel(r"$T_1$ Lifetime ($\mu s$)")
+    axes[i].legend()
+
+plt.tight_layout(); plt.show()
+# =========================================================
+# 7. TLS BIMODALITY ANALYSIS (MC=30)
+# =========================================================
+print("\n=== TLS BIMODALITY ANALYSIS (MC=30) ===\n")
+
+bic_rows = []
+
+for n in model_order:
+
+    delta_bics = []
+    bic1_vals = []
+    bic2_vals = []
+
+    for p_curr in preds[n]:
+
+        # Recover effective lambda
+        l_vals = effective_lambda(X, p_curr)
+
+        # Convert to extracted T1 distribution
+        t1_ext = 1.0 / np.clip(l_vals, 1e-8, None)
+
+        # Compute 1-mode vs 2-mode BIC
+        bic1, bic2 = bimodality_bics(t1_ext)
+
+        bic1_vals.append(bic1)
+        bic2_vals.append(bic2)
+        delta_bics.append(bic1 - bic2)
+
+    bic1_vals = np.array(bic1_vals)
+    bic2_vals = np.array(bic2_vals)
+    delta_bics = np.array(delta_bics)
+
+    bic_rows.append({
+        "Model": n,
+        "BIC_1": f"{bic1_vals.mean():.3f} ± {bic1_vals.std():.3f}",
+        "BIC_2": f"{bic2_vals.mean():.3f} ± {bic2_vals.std():.3f}",
+        "Delta_BIC": f"{delta_bics.mean():.3f} ± {delta_bics.std():.3f}"
+    })
+
+bic_df = pd.DataFrame(bic_rows)
+
+print(bic_df.to_string(index=False))
+
+print("\nInterpretation:")
+print("Positive ΔBIC = bimodal (2-component) structure preferred")
+print("Negative ΔBIC = unimodal (1-component) structure preferred")
