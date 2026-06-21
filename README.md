@@ -25,7 +25,7 @@ The framework compares standard data-driven methods, pure physics-informed neura
 
 * **NN (SirenNet):** A deep neural network utilizing Sinusoidal Representation (SIREN) layers with a frequency scaling parameter of 10.0 to fit the coordinate-to-value mapping.
 * **PINN (Physics-Informed Neural Network):** Parallel SIREN networks that jointly predict the population curve and the continuous decay rate parameter.
-* **HYB (Hybrid PINN + Neural Residual):** Features a frozen, pre-trained PINN architecture supplemented by an independent SIREN residual network trained to fit the remaining unmodeled data variance.
+* **HYB (Hybrid PINN + Neural Residual):** Features a  pre-trained PINN architecture supplemented by an independent SIREN residual network trained to fit the remaining unmodeled data variance.
 * **GB (Gradient Boosting):** A standard non-parametric tree ensemble with 300 estimators trained purely on the empirical coordinate data points.
 * **PILR (Physics-Informed Linear Regression):** A linear framework that projects inputs onto a combined baseline matrix composed of a constant offset and the physical exponential decay basis.
 * **PILR_GB (Hybrid PILR + Tree Residual):** Pairs the rigid exponential basis of the PILR model with a downstream Gradient Boosting Regressor that fits the residual errors.
