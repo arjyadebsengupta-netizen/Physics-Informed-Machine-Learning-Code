@@ -1,0 +1,451 @@
+
+import os, random, argparse, warnings
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from scipy.signal import find_peaks, savgol_filter
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.mixture import GaussianMixture
+from sklearn.neighbors import KernelDensity
+
+warnings.filterwarnings("ignore")
+
+# =========================================================
+# CONFIG
+# =========================================================
+SEED = 42
+T_SPAN, N_POINTS, N_TEST = 200.0, 50, 10
+T1_STATES = (58.0, 42.0)             # us (state 0 / state 1)
+SIGMA_T1, SIGMA_READ = 2.0, 0.015
+DWELL_US = 40.0                      # mean TLS dwell time (us) -> ~5 switches per 200 us trace
+FINE = 20                            # fine-grid sub-steps per sample interval for the exact integral
+T1_PRIOR = 50.0                      # generic prior for PILR_fix (not any trace's true value)
+T1_MIN, T1_MAX = 5.0, 300.0
+K_SIGMA = 3.0
+TRUE_PEAKS, PEAK_TOL = (42.0, 58.0), 3.0
+KDE_BW = 1.2
+SG_WINDOW = 7
+HIDDEN, DEPTH, W0 = 64, 2, 10.0
+ADAM_EPOCHS, LBFGS_ITERS, LR = 400, 200, 1e-3
+NORMALIZE_T = True
+X_SCALE = (1.0 / T_SPAN) if NORMALIZE_T else 1.0
+GB_EST_PURE, GB_EST_RES = 300, 100
+MODELS = ["NN", "PINN", "HYB", "GB", "PILR_fix", "PILR_fit", "PILR_GB_fix", "PILR_GB_fit"]
+XG = np.linspace(20, 90, 700).reshape(-1, 1)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.environ["PYTHONHASHSEED"] = str(SEED)
+
+
+def set_all_seeds(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# =========================================================
+# 1. DATA: time-dependent T1(t), exact integral forward model
+# =========================================================
+def generate_data(seed):
+    rng = np.random.RandomState(seed)
+    n_fine = (N_POINTS - 1) * FINE + 1
+    tf = np.linspace(0, T_SPAN, n_fine); dtf = tf[1] - tf[0]
+    T1f = np.empty(n_fine)
+    state, i = rng.randint(2), 0
+    while i < n_fine:                                    # telegraph process in time
+        n_seg = max(1, int(round(rng.exponential(DWELL_US) / dtf)))
+        T1f[i:i + n_seg] = T1_STATES[state] + rng.normal(0, SIGMA_T1)   # jitter per dwell
+        i += n_seg; state = 1 - state
+    lam = 1.0 / T1f
+    Lam = np.concatenate([[0.0], np.cumsum(0.5 * (lam[1:] + lam[:-1]) * dtf)])   # int lam dtau
+    sel = np.arange(0, n_fine, FINE)
+    t, Pe, T1_inst = tf[sel], np.exp(-Lam)[sel], T1f[sel]
+    y = Pe + rng.normal(0, SIGMA_READ, N_POINTS)
+    return t, y, Pe, T1_inst
+
+
+# =========================================================
+# 2. MODELS (SIREN, PINN with lam(t) network, residual, hybrid)
+# =========================================================
+class SirenLayer(nn.Module):
+    def __init__(self, in_f, out_f, w0=W0, is_first=False):
+        super().__init__()
+        self.w0, self.linear = w0, nn.Linear(in_f, out_f)
+        with torch.no_grad():
+            bound = 1.0 / in_f if is_first else np.sqrt(6.0 / in_f) / w0
+            self.linear.weight.uniform_(-bound, bound); self.linear.bias.zero_()
+
+    def forward(self, x):
+        return torch.sin(self.w0 * self.linear(x))
+
+
+class SirenNet(nn.Module):
+    def __init__(self, in_dim=1, hidden=HIDDEN, depth=DEPTH, out_dim=1, w0=W0):
+        super().__init__()
+        layers = [SirenLayer(in_dim, hidden, w0, True)] + [SirenLayer(hidden, hidden, w0) for _ in range(depth - 1)]
+        self.net, self.final = nn.Sequential(*layers), nn.Linear(hidden, out_dim)
+        with torch.no_grad():
+            b = np.sqrt(6.0 / hidden) / w0
+            self.final.weight.uniform_(-b, b); self.final.bias.zero_()
+
+    def forward(self, x):
+        return self.final(self.net(x))
+
+
+class PINN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.y_net, self.lam_net = SirenNet(), SirenNet()
+
+    def forward(self, x):
+        return self.y_net(x), torch.abs(self.lam_net(x))
+
+
+def train(model, X_tr, y_tr, is_pinn=False):
+    """Adam then LBFGS(strong Wolfe). PINN loss: adaptive-weighted data + ODE residual
+    (dy/dt + lam(t) y)^2, with dy/dt = dy/dx * X_SCALE. LBFGS result rejected if non-finite/worse."""
+    Xt = torch.tensor(X_tr * X_SCALE, dtype=torch.float32, device=device)
+    yt = torch.tensor(y_tr, dtype=torch.float32, device=device)
+    lv = nn.Parameter(torch.zeros(2, device=device))
+    params = list(model.parameters()) + ([lv] if is_pinn else [])
+
+    def loss_fn():
+        if not is_pinn:
+            return ((model(Xt) - yt) ** 2).mean()
+        x = Xt.clone().requires_grad_(True)
+        y_p, lam = model(x)
+        dy = torch.autograd.grad(y_p, x, torch.ones_like(y_p), create_graph=True)[0]
+        ld = ((y_p - yt) ** 2).mean()
+        lp = ((dy * X_SCALE + lam * y_p) ** 2).mean()
+        a, b = lv[0].clamp(-5, 5), lv[1].clamp(-5, 5)
+        return torch.exp(-a) * ld + a + torch.exp(-b) * lp + b
+
+    opt = torch.optim.Adam(params, lr=LR)
+    for _ in range(ADAM_EPOCHS):
+        opt.zero_grad(); l = loss_fn(); l.backward(); opt.step()
+    snap = [p.detach().clone() for p in params]
+    before = loss_fn().item()
+    lbfgs = torch.optim.LBFGS(params, max_iter=LBFGS_ITERS, line_search_fn="strong_wolfe")
+
+    def closure():
+        lbfgs.zero_grad(); l = loss_fn(); l.backward(); return l
+    try:
+        lbfgs.step(closure)
+        after = loss_fn().item()
+        ok = np.isfinite(after) and after <= before + 1e-12
+    except RuntimeError:
+        ok = False
+    if not ok:
+        with torch.no_grad():
+            for p, s in zip(params, snap):
+                p.copy_(s)
+    return model
+
+
+def _x(t):
+    return torch.tensor(t * X_SCALE, dtype=torch.float32, device=device).view(-1, 1)
+
+
+def predict(model, t):
+    with torch.no_grad():
+        return model(_x(t)).cpu().numpy().ravel()
+
+
+def predict_pinn(pinn, t):
+    with torch.no_grad():
+        y, lam = pinn(_x(t))
+    return y.cpu().numpy().ravel(), lam.cpu().numpy().ravel()
+
+
+def classical_fits(t, y, tr, seed):
+    lam_prior = 1.0 / T1_PRIOR
+    ttr, ytr, T = t[tr], y[tr], t.reshape(-1, 1)
+    basis = lambda tt, lam: np.column_stack([np.ones_like(tt), np.exp(-tt * lam)])
+    out = {"GB": GradientBoostingRegressor(random_state=seed, n_estimators=GB_EST_PURE)
+           .fit(ttr.reshape(-1, 1), ytr).predict(T)}
+    w = np.linalg.pinv(basis(ttr, lam_prior)) @ ytr                     # PILR, fixed generic prior
+    b_fix_tr, b_fix = basis(ttr, lam_prior) @ w, basis(t, lam_prior) @ w
+    f = lambda tt, w0, w1, lam: w0 + w1 * np.exp(-lam * tt)             # PILR, fitted single lambda
+    try:
+        popt, _ = curve_fit(f, ttr, ytr, p0=[0.0, 1.0, lam_prior],
+                            bounds=([-0.5, 0.2, 1 / T1_MAX], [0.5, 2.0, 1 / T1_MIN]))
+    except Exception:
+        popt = np.array([w[0], w[1], lam_prior])
+    b_fit_tr, b_fit = f(ttr, *popt), f(t, *popt)
+    out["PILR_fix"], out["PILR_fit"], out["lam_fit"] = b_fix, b_fit, popt[2]
+    for tag, btr, bfull in (("fix", b_fix_tr, b_fix), ("fit", b_fit_tr, b_fit)):
+        gb = GradientBoostingRegressor(random_state=seed, n_estimators=GB_EST_RES)\
+            .fit(ttr.reshape(-1, 1), ytr - btr)                         # residual on TRAIN only
+        out[f"PILR_GB_{tag}"] = bfull + gb.predict(T)
+    return out
+
+
+def fit_all_models(t, y, tr, seed):
+    Xtr, ytr = t[tr].reshape(-1, 1), y[tr].reshape(-1, 1)
+    set_all_seeds(seed); m_nn = train(SirenNet().to(device), Xtr, ytr)
+    set_all_seeds(seed); m_pinn = train(PINN().to(device), Xtr, ytr, is_pinn=True)
+    y_pinn, lam_pinn = predict_pinn(m_pinn, t)
+    res_tr = ytr - y_pinn[tr].reshape(-1, 1)
+    set_all_seeds(seed); m_res = train(SirenNet().to(device), Xtr, res_tr)
+    P = {"NN": predict(m_nn, t), "PINN": y_pinn, "HYB": y_pinn + predict(m_res, t)}
+    cl = classical_fits(t, y, tr, seed)
+    for k in ["GB", "PILR_fix", "PILR_fit", "PILR_GB_fix", "PILR_GB_fit"]:
+        P[k] = cl[k]
+    lam_param = {"PINN": lam_pinn, "PILR_fit": np.full(len(t), cl["lam_fit"])}   # models' own lambda
+    return {k: np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0) for k, v in P.items()}, lam_param
+
+
+# =========================================================
+# 3. INVERSE STEP + METRICS
+# =========================================================
+def _to_t1(lam):
+    T1 = np.full(lam.shape, np.nan)
+    pos = lam > 0
+    T1[pos] = 1.0 / lam[pos]
+    T1[(T1 < T1_MIN) | (T1 > T1_MAX)] = np.nan       # failure, NOT clipped
+    return T1
+
+
+def extract_t1(P, t):
+    """grad: -d/dt log y by central finite differences (np.gradient), no smoothing.
+       sg  : -d/dt log y by Savitzky-Golay derivative (window SG_WINDOW, polyorder 2)."""
+    logy = np.log(np.clip(P, 1e-8, None))
+    return {"grad": _to_t1(-np.gradient(logy, t)),
+            "sg": _to_t1(-savgol_filter(logy, SG_WINDOW, 2, deriv=1, delta=t[1] - t[0]))}
+
+
+def gmm_stats(v, seed):
+    bad = dict(BIC1=np.nan, BIC2=np.nan, dBIC=np.nan, mu1=np.nan, mu2=np.nan,
+               w_min=np.nan, peak_err=np.nan, two_state_ok=0.0)
+    if len(v) < 15 or np.std(v) < 1e-6:                 # too few points or constant estimate
+        return bad
+    a = v.reshape(-1, 1)
+    g1 = GaussianMixture(1, random_state=seed).fit(a)
+    g2 = GaussianMixture(2, random_state=seed, n_init=5).fit(a)
+    o = np.argsort(g2.means_.ravel()); mu, w = g2.means_.ravel()[o], g2.weights_[o]
+    err = np.array([mu[0] - TRUE_PEAKS[0], mu[1] - TRUE_PEAKS[1]])
+    ok = float(w.min() >= 0.1 and np.all(np.abs(err) <= PEAK_TOL))
+    return dict(BIC1=g1.bic(a), BIC2=g2.bic(a), dBIC=g1.bic(a) - g2.bic(a), mu1=mu[0], mu2=mu[1],
+                w_min=w.min(), peak_err=float(np.sqrt(np.mean(err ** 2))), two_state_ok=ok)
+
+
+def evaluate_estimate(e, mask, T1_inst, seed):
+    em, Tm = e[mask], T1_inst[mask]
+    fin = np.isfinite(em)
+    acc = float(np.mean(np.where(fin, (em > 50) == (Tm > 50), False)))
+    rmse = float(np.sqrt(np.mean((em[fin] - Tm[fin]) ** 2))) if fin.any() else np.nan
+    return dict(fail_frac=1 - fin.mean(), T1_RMSE=rmse, state_acc=acc, **gmm_stats(em[fin], seed)), em[fin]
+
+
+def predictive_metrics(P, y, t, tr, te, T1_inst):
+    tr_mse, te_mse = np.mean((P[tr] - y[tr]) ** 2), np.mean((P[te] - y[te]) ** 2)
+    r2 = 1 - np.sum((P[te] - y[te]) ** 2) / np.sum((y[te] - y[te].mean()) ** 2)
+    phys = np.mean((np.gradient(P, t) + (1.0 / T1_inst) * P) ** 2)       # true lam(t), metric only
+    return dict(Train_MSE=tr_mse, Test_MSE=te_mse, R2=r2,
+                Gen=abs(tr_mse - te_mse) / (te_mse + 1e-8), Physics_Residual=phys)
+
+
+# =========================================================
+# 4. EXPERIMENT
+# =========================================================
+def run_experiment(n_train, n_mc, keep_example=False):
+    pred_rows, t1_rows, pool_mc, example = [], [], {}, None
+    for mc in range(n_mc):
+        seed = SEED + mc
+        t, y, Pe, T1_inst = generate_data(seed)                         # shared by all models
+        perm = np.random.RandomState(seed + 10_000).permutation(N_POINTS)
+        te, tr = np.sort(perm[:N_TEST]), np.sort(perm[N_TEST:N_TEST + n_train])
+        P, lam_param = fit_all_models(t, y, tr, seed)
+        mask = Pe > K_SIGMA * SIGMA_READ                                 # common evaluation window
+
+        def log(model, method, e):
+            row, v = evaluate_estimate(e, mask, T1_inst, seed)
+            t1_rows.append(dict(mc=mc, n_train=n_train, Model=model, Method=method, **row))
+            pool_mc.setdefault((model, method), []).append(v)           # one array per MC run
+
+        for meth, e in extract_t1(Pe, t).items():                        # ceiling: same estimator, no noise
+            log("TRUE", meth, e)
+        log("TRUE", "param", T1_inst.copy())
+        pool_mc.setdefault(("INST", "inst"), []).append(T1_inst[mask])
+        for m in MODELS:
+            pred_rows.append(dict(mc=mc, n_train=n_train, Model=m, **predictive_metrics(P[m], y, t, tr, te, T1_inst)))
+            for meth, e in extract_t1(P[m], t).items():
+                log(m, meth, e)
+            if m in lam_param:
+                log(m, "param", _to_t1(lam_param[m]))
+        if keep_example and mc == 0:
+            example = dict(t=t, y=y, Pe=Pe, T1=T1_inst, tr=tr, mask=mask, P=P)
+        print(f"  [n_train={n_train}] MC {mc + 1}/{n_mc}", flush=True)
+    return pd.DataFrame(pred_rows), pd.DataFrame(t1_rows), pool_mc, example
+
+
+# =========================================================
+# 5. TABLES + FIGURES
+# =========================================================
+def ms(s, f):
+    return f"{s.mean():{f}} ± {s.std():{f}}"
+
+
+def table_pred(pdf):
+    return pd.DataFrame([dict(Model=m, Train_MSE=ms(d.Train_MSE, ".3e"), Test_MSE=ms(d.Test_MSE, ".3e"),
+                              R2=ms(d.R2, ".4f"), Gen=ms(d.Gen, ".3e"),
+                              Physics_Residual=ms(d.Physics_Residual, ".3e"))
+                         for m in MODELS for d in [pdf[pdf.Model == m]]])
+
+
+def table_t1(tdf, method):
+    rows = []
+    for m in ["TRUE"] + MODELS:
+        d = tdf[(tdf.Model == m) & (tdf.Method == method)]
+        if d.empty:
+            continue
+        rows.append(dict(Model=m, Fail=ms(d.fail_frac, ".3f"), T1_RMSE=ms(d.T1_RMSE, ".2f"),
+                         State_Acc=ms(d.state_acc, ".3f"), dBIC=ms(d.dBIC, ".1f"),
+                         mu1=ms(d.mu1, ".2f"), mu2=ms(d.mu2, ".2f"), Peak_Err=ms(d.peak_err, ".2f"),
+                         Frac_TwoState_OK=f"{d.two_state_ok.mean():.2f}"))
+    return pd.DataFrame(rows)
+
+
+def kde_peaks(arr, h):
+    if len(arr) < 10:
+        return []
+    dens = np.exp(KernelDensity(bandwidth=h).fit(arr.reshape(-1, 1)).score_samples(XG))
+    pk, _ = find_peaks(dens, height=0.05 * dens.max())
+    return [round(float(x), 1) for x in XG.ravel()[pk]]
+
+
+def table_pooled(pool_mc, method):
+    rows = []
+    for m in ["TRUE"] + MODELS:
+        runs = pool_mc.get((m, method))
+        if runs is None:
+            continue
+        arr = np.concatenate(runs)
+        g = gmm_stats(arr, SEED)
+        rows.append(dict(Model=m, N=len(arr), mu1=round(g["mu1"], 2), mu2=round(g["mu2"], 2),
+                         Peak_Err=round(g["peak_err"], 2),
+                         dBIC=round(g["dBIC"], 1) if np.isfinite(g["dBIC"]) else np.nan,
+                         KDE_peaks={h: kde_peaks(arr, h) for h in (0.6, KDE_BW, 2.4)}))
+    return pd.DataFrame(rows)
+
+
+def table_sweep(pdf_all, tdf_all, method):
+    rows = []
+    for n in sorted(pdf_all.n_train.unique()):
+        for m in MODELS:
+            dp = pdf_all[(pdf_all.n_train == n) & (pdf_all.Model == m)]
+            dt = tdf_all[(tdf_all.n_train == n) & (tdf_all.Model == m) & (tdf_all.Method == method)]
+            rows.append(dict(n_train=n, Model=m,
+                             Test_MSE=ms(dp.Test_MSE, ".3e"), T1_RMSE=ms(dt.T1_RMSE, ".2f"),
+                             State_Acc=ms(dt.state_acc, ".3f"), mu1=ms(dt.mu1, ".2f"), mu2=ms(dt.mu2, ".2f"),
+                             Peak_Err=ms(dt.peak_err, ".2f"), Fail=ms(dt.fail_frac, ".3f"),
+                             Frac_TwoState_OK=f"{dt.two_state_ok.mean():.2f}"))
+    return pd.DataFrame(rows)
+
+
+def plot_example(ex, method, path, n_train):
+    t, fig = ex["t"], plt.figure(figsize=(16, 5.5))
+    a1, a2 = fig.add_subplot(1, 2, 1), fig.add_subplot(1, 2, 2)
+    te = np.setdiff1d(np.arange(N_POINTS), ex["tr"])
+    a1.scatter(t[ex["tr"]], ex["y"][ex["tr"]], c="k", s=18, label="train pts")
+    a1.scatter(t[te], ex["y"][te], facecolors="none", edgecolors="k", s=28, label="held-out pts")
+    a1.plot(t, ex["Pe"], "k--", lw=1, label="noise-free truth")
+    a2.step(t, ex["T1"], "k", where="mid", lw=2, label=r"true $T_1(t)$")
+    for m in MODELS:
+        a1.plot(t, ex["P"][m], lw=1.4, label=m)
+        a2.plot(t[ex["mask"]], extract_t1(ex["P"][m], t)[method][ex["mask"]], ".-", lw=.8, ms=3, label=m)
+    a1.set_xlabel("Readout delay (µs)"); a1.set_ylabel(r"$P_e$"); a1.legend(fontsize=7, ncol=2); a1.grid(alpha=.3)
+    a1.set_title(f"Example trace (n_train={n_train})")
+    a2.set_xlabel("Time (µs)"); a2.set_ylabel(r"$T_{1,eff}$ (µs)"); a2.set_ylim(20, 100)
+    a2.set_title(f"Recovered T1(t), extraction={method}"); a2.legend(fontsize=7, ncol=2); a2.grid(alpha=.3)
+    plt.tight_layout(); plt.savefig(path, dpi=150); plt.show(); plt.close()
+
+
+def plot_kde_grid(pool_mc, method, path, n_train):
+    fig, axes = plt.subplots(2, 4, figsize=(20, 9), sharex=True)
+    inst = np.concatenate(pool_mc[("INST", "inst")])
+    for ax, m in zip(axes.ravel(), MODELS):
+        ax.hist(inst, bins=60, range=(20, 90), density=True, color="gray", alpha=.3, label=r"True $T_1(t)$")
+        runs = pool_mc.get((m, method), [])
+        dens = [np.exp(KernelDensity(bandwidth=KDE_BW).fit(v.reshape(-1, 1)).score_samples(XG))
+                for v in runs if len(v) >= 5]                            # one KDE per MC run
+        if dens:
+            dens = np.array(dens)
+            mu, sd = dens.mean(axis=0), dens.std(axis=0)
+            ax.plot(XG.ravel(), mu, "r", lw=2, label=f"{m} KDE mean (h={KDE_BW})")
+            ax.fill_between(XG.ravel(), np.clip(mu - sd, 0, None), mu + sd,
+                            color="r", alpha=.25, label=r"$\pm\sigma$ over MC")
+        for p in TRUE_PEAKS:
+            ax.axvline(p, color="b", ls=":", lw=1)
+        ax.set_title(m); ax.set_xlabel(r"$T_1$ (µs)"); ax.legend(fontsize=8)
+    plt.suptitle(f"Recovered T1(t) distributions, extraction={method}, n_train={n_train}: mean ± σ over MC KDEs")
+    plt.tight_layout(); plt.savefig(path, dpi=150); plt.show(); plt.close()
+
+
+def plot_sweep(pdf_all, tdf_all, method, path):
+    fig, axes = plt.subplots(1, 4, figsize=(24, 5))
+    for m in MODELS:
+        a = pdf_all[pdf_all.Model == m].groupby("n_train").Test_MSE.agg(["mean", "std"])
+        b = tdf_all[(tdf_all.Model == m) & (tdf_all.Method == method)].groupby("n_train")[
+            ["T1_RMSE", "state_acc", "peak_err"]].agg(["mean", "std"])
+        axes[0].errorbar(a.index, a["mean"], a["std"], marker="o", capsize=2, label=m)
+        axes[1].errorbar(b.index, b[("T1_RMSE", "mean")], b[("T1_RMSE", "std")], marker="o", capsize=2, label=m)
+        axes[2].errorbar(b.index, b[("state_acc", "mean")], b[("state_acc", "std")], marker="o", capsize=2, label=m)
+        axes[3].errorbar(b.index, b[("peak_err", "mean")], b[("peak_err", "std")], marker="o", capsize=2, label=m)
+    axes[0].set_yscale("log"); axes[0].set_title("Test MSE")
+    axes[1].set_title(f"T1 RMSE (µs), {method}"); axes[2].set_title(f"State accuracy, {method}")
+    axes[3].set_title(f"GMM peak error (µs), {method}")
+    for ax in axes:
+        ax.set_xlabel("# training points"); ax.grid(alpha=.3)
+    axes[0].legend(fontsize=7)
+    plt.tight_layout(); plt.savefig(path, dpi=150); plt.show(); plt.close()
+
+
+# =========================================================
+# 6. MAIN  (works in Colab / Jupyter / terminal)
+# =========================================================
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mc", type=int, default=30)
+    ap.add_argument("--ntrain", type=int, nargs="+", default=[10, 20, 30, 40])
+    ap.add_argument("--primary", default="grad", choices=["grad", "sg"])
+    ap.add_argument("--out", default="results")
+    A, _ = ap.parse_known_args()          # ignores Colab/Jupyter's extra "-f kernel.json"
+    os.makedirs(A.out, exist_ok=True)
+    print(f"device={device}  MC={A.mc}  n_train={A.ntrain}")
+
+    all_p, all_t = [], []
+    for n in A.ntrain:
+        out = f"{A.out}/n{n}"
+        os.makedirs(out, exist_ok=True)
+        print(f"\n################  n_train = {n}  ################")
+        pdf, tdf, pool_mc, ex = run_experiment(n, A.mc, keep_example=True)
+        pdf.to_csv(f"{out}/pred_metrics_raw.csv", index=False)
+        tdf.to_csv(f"{out}/t1_metrics_raw.csv", index=False)
+        all_p.append(pdf); all_t.append(tdf)
+
+        print(f"\n=== TABLE I [n_train={n}]: predictive metrics (mean ± std over MC) ===")
+        tI = table_pred(pdf); print(tI.to_string(index=False)); tI.to_csv(f"{out}/table_I.csv", index=False)
+        for meth in ["grad", "sg", "param"]:
+            print(f"\n=== TABLE II [{meth}, n_train={n}]: T1(t) / TLS-state recovery (mean ± std over MC) ===")
+            t2 = table_t1(tdf, meth); print(t2.to_string(index=False))
+            t2.to_csv(f"{out}/table_II_{meth}.csv", index=False)
+            print(f"\n--- pooled over all MC [{meth}, n_train={n}] (GMM peaks, KDE peaks at h=0.6/{KDE_BW}/2.4) ---")
+            print(table_pooled(pool_mc, meth).to_string(index=False))
+
+        plot_example(ex, A.primary, f"{out}/fig1_example_trace.png", n)
+        for meth in ["grad", "sg"]:
+            plot_kde_grid(pool_mc, meth, f"{out}/fig2_kde_{meth}.png", n)
+
+    all_p, all_t = pd.concat(all_p), pd.concat(all_t)
+    all_p.to_csv(f"{A.out}/sweep_pred.csv", index=False)
+    all_t.to_csv(f"{A.out}/sweep_t1.csv", index=False)
+    for meth in ["grad", "sg"]:
+        print(f"\n=== SWEEP SUMMARY [{meth}]: mean ± std over MC for every n_train ===")
+        ts = table_sweep(all_p, all_t, meth); print(ts.to_string(index=False))
+        ts.to_csv(f"{A.out}/sweep_summary_{meth}.csv", index=False)
+    plot_sweep(all_p, all_t, A.primary, f"{A.out}/fig3_sweep.png")
+    print(f"\nAll outputs saved in ./{A.out}/")
